@@ -125,6 +125,7 @@ library:
   - Hledger.Read.Common
   - Hledger.Read.CsvReader
   - Hledger.Read.JournalReader
+  - Hledger.Read.JournalTokenizer
 #  - Hledger.Read.LedgerReader
   - Hledger.Read.TimedotReader
   - Hledger.Read.TimeclockReader

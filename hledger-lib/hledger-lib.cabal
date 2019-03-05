@@ -73,6 +73,7 @@ library
       Hledger.Read.Common
       Hledger.Read.CsvReader
       Hledger.Read.JournalReader
+      Hledger.Read.JournalTokenizer
       Hledger.Read.TimedotReader
       Hledger.Read.TimeclockReader
       Hledger.Reports
@@ -174,6 +175,7 @@ test-suite doctests
       Hledger.Read.Common
       Hledger.Read.CsvReader
       Hledger.Read.JournalReader
+      Hledger.Read.JournalTokenizer
       Hledger.Read.TimeclockReader
       Hledger.Read.TimedotReader
       Hledger.Reports
@@ -276,6 +278,7 @@ test-suite easytests
       Hledger.Read.Common
       Hledger.Read.CsvReader
       Hledger.Read.JournalReader
+      Hledger.Read.JournalTokenizer
       Hledger.Read.TimeclockReader
       Hledger.Read.TimedotReader
       Hledger.Reports

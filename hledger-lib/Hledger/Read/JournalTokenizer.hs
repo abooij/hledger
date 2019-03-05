@@ -1,128 +1,61 @@
---- * doc
--- Lines beginning "--- *" are collapsible orgstruct nodes. Emacs users,
--- (add-hook 'haskell-mode-hook
---   (lambda () (set-variable 'orgstruct-heading-prefix-regexp "--- " t))
---   'orgstruct-mode)
--- and press TAB on nodes to expand/collapse.
+{-# LANGUAGE OverloadedStrings, NamedFieldPuns #-}
 
-{-|
+module Hledger.Read.JournalTokenizer where
 
-A reader for hledger's journal file format
-(<http://hledger.org/MANUAL.html#the-journal-file>).  hledger's journal
-format is a compatible subset of c++ ledger's
-(<http://ledger-cli.org/3.0/doc/ledger3.html#Journal-Format>), so this
-reader should handle many ledger files as well. Example:
-
-@
-2012\/3\/24 gift
-    expenses:gifts  $10
-    assets:cash
-@
-
-Journal format supports the include directive which can read files in
-other formats, so the other file format readers need to be importable
-here.  Some low-level journal syntax parsers which those readers also
-use are therefore defined separately in Hledger.Read.Common, avoiding
-import cycles.
-
--}
-
---- * module
-
-{-# LANGUAGE CPP, RecordWildCards, NamedFieldPuns, NoMonoLocalBinds, ScopedTypeVariables, FlexibleContexts, TupleSections, OverloadedStrings, PackageImports #-}
-
-module Hledger.Read.JournalReader (
---- * exports
-
-  -- * Reader
-  reader,
-
-  -- * Parsing utils
-  genericSourcePos,
-  parseAndFinaliseJournal,
-  runJournalParser,
-  rjp,
-
-  -- * Parsers used elsewhere
-  getParentAccount,
-  journalp,
-  directivep,
-  accountaliasp,
-  defaultyeardirectivep,
-  marketpricedirectivep,
-  datetimep,
-  datep,
-  modifiedaccountnamep,
-  postingp,
-  statusp,
-  emptyorcommentlinep,
-  followingcommentp,
-  accountTypeTagName,
-  parseAccountTypeCode,
-  pleaseincludedecimalpoint
-
-  -- * Tests
-  ,tests_JournalReader
-)
-where
---- * imports
-import Prelude ()
-import "base-compat-batteries" Prelude.Compat hiding (readFile)
-import qualified Control.Exception as C
-import Control.Monad
-import Control.Monad.Except (ExceptT(..), runExceptT)
-import Control.Monad.State.Strict
-import qualified Data.Map.Strict as M
-import Data.Text (Text)
-import Data.String
-import Data.List
-import qualified Data.Text as T
-import Data.Time.Calendar
-import Data.Time.LocalTime
-import Safe
-import Text.Megaparsec hiding (parse)
+import Control.Monad (void)
+import Text.Megaparsec
 import Text.Megaparsec.Char
+import qualified Text.Megaparsec.Char.Lexer as M
+import Data.Text (Text)
+import qualified Data.Text as T
+import Data.Functor (($>))
+import Data.Decimal (DecimalRaw (Decimal), Decimal)
+import Data.List (intercalate, intersperse)
+import Safe (lastMay)
+import Data.String (fromString)
+import Data.Maybe (isJust)
+
+import qualified Hledger.Data as H
+import Hledger.Data hiding (Journal, transaction)
 import Text.Megaparsec.Custom
-import Text.Printf
-import System.FilePath
-import "Glob" System.FilePath.Glob hiding (match)
+import qualified Hledger.Utils.Parse as P
+import Hledger.Utils.Parse
+import qualified Hledger.Utils.String as S
+import qualified Hledger.Read.Common as C
+import Hledger.Read.Common hiding (amountp, balanceassertionp, fixedlotpricep, priceamountp)
+import qualified Hledger.Read.JournalReader as R
 
-import Hledger.Data
-import Hledger.Read.Common
-import Hledger.Read.TimeclockReader (timeclockfilep)
-import Hledger.Read.TimedotReader (timedotfilep)
-import Hledger.Utils
+import Hledger.Utils.Debug
+import Debug.Trace
 
--- $setup
--- >>> :set -XOverloadedStrings
+type Parser a = Parsec CustomErr Text a
 
---- * reader
+data Journal = Journal [Item]
+data Item
+  = DirectiveItem Directive
+  | TransactionItem H.Transaction
+  | TransactionModifierItem H.TransactionModifier
+  | PeriodicTransactionItem H.PeriodicTransaction
+  | MarketPriceDirectiveItem H.MarketPrice
+  | CommentItem Text
+data Directive
+  = IncludeDirective FilePath
+  | AliasDirective H.AccountAlias
+  | EndAliasesDirective
+  | AccountDirective H.AccountName (Maybe H.AccountType) [H.Tag]
+  | ApplyAccountDirective H.AccountName
+  | CommodityDirective H.Commodity
+  | EndApplyAccountDirective
+  | TagDirective
+  | EndTagDirective
+  | DefaultYearDirective H.Year
+  | DefaultCommodityDirective H.CommoditySymbol H.AmountStyle
+  | CommodityConversionDirective H.Amount H.Amount
+  | IgnoredPriceCommodityDirective H.CommoditySymbol
+  deriving (Show)
 
-reader :: Reader
-reader = Reader
-  {rFormat     = "journal"
-  ,rExtensions = ["journal", "j", "hledger", "ledger"]
-  ,rParser     = parse
-  ,rExperimental = False
-  }
 
--- | Parse and post-process a "Journal" from hledger's journal file
--- format, or give an error.
-parse :: InputOpts -> FilePath -> Text -> ExceptT String IO Journal
-parse iopts = parseAndFinaliseJournal journalp' iopts
-  where
-    journalp' = do 
-      -- reverse parsed aliases to ensure that they are applied in order given on commandline
-      mapM_ addAccountAlias (reverse $ aliasesFromOpts iopts) 
-      journalp
-
--- | Get the account name aliases from options, if any.
-aliasesFromOpts :: InputOpts -> [AccountAlias]
-aliasesFromOpts = map (\a -> fromparse $ runParser accountaliasp ("--alias "++quoteIfNeeded a) $ T.pack a)
-                  . aliases_
-
---- * parsers
---- ** journal
+--- * from JournalReader.hs
 
 -- | A journal parser. Accumulates and returns a "ParsedJournal",
 -- which should be finalised/validated before use.
@@ -130,34 +63,34 @@ aliasesFromOpts = map (\a -> fromparse $ runParser accountaliasp ("--alias "++qu
 -- >>> rejp (journalp <* eof) "2015/1/1\n a  0\n"
 -- Right (Right Journal  with 1 transactions, 1 accounts)
 --
-journalp :: MonadIO m => ErroringJournalParser m ParsedJournal
-journalp = do
-  many addJournalItemP
-  eof
-  get
+journalp :: Parser Journal
+journalp = Journal <$> many addJournalItemP
 
 -- | A side-effecting parser; parses any kind of journal item
 -- and updates the parse state accordingly.
-addJournalItemP :: MonadIO m => ErroringJournalParser m ()
-addJournalItemP =
+addJournalItemP :: Parser Item
+addJournalItemP = do
   -- all journal line types can be distinguished by the first
   -- character, can use choice without backtracking
-  choice [
-      directivep
-    , transactionp          >>= modify' . addTransaction
-    , transactionmodifierp  >>= modify' . addTransactionModifier
-    , periodictransactionp  >>= modify' . addPeriodicTransaction
-    , marketpricedirectivep >>= modify' . addMarketPrice
-    , void (lift emptyorcommentlinep)
-    , void (lift multilinecommentp)
+  i <- choice [
+      DirectiveItem            <$> directivep
+    , TransactionItem          <$> transactionp
+    , TransactionModifierItem  <$> transactionmodifierp
+    , PeriodicTransactionItem  <$> periodictransactionp
+    , MarketPriceDirectiveItem <$> marketpricedirectivep
     ] <?> "transaction or directive"
+  many $ choice
+    [ void (emptyorcommentlinep)
+    , void (multilinecommentp)
+    ]
+  return i
 
 --- ** directives
 
 -- | Parse any journal directive and update the parse state accordingly.
 -- Cf http://hledger.org/manual.html#directives,
 -- http://ledger-cli.org/3.0/doc/ledger3.html#Command-Directives
-directivep :: MonadIO m => ErroringJournalParser m ()
+directivep :: Parser Directive
 directivep = (do
   optional $ char '!'
   choice [
@@ -177,129 +110,57 @@ directivep = (do
    ]
   ) <?> "directive"
 
-includedirectivep :: MonadIO m => ErroringJournalParser m ()
+includedirectivep :: Parser Directive
 includedirectivep = do
   string "include"
-  lift (skipSome spacenonewline)
+  (skipSome P.spacenonewline)
   filename <- T.unpack <$> takeWhileP Nothing (/= '\n') -- don't consume newline yet
 
-  parentoff <- getOffset
-  parentpos <- getSourcePos
-
-  filepaths <- getFilePaths parentoff parentpos filename
-
-  forM_ filepaths $ parseChild parentpos
-
   void newline
-
-  where
-    getFilePaths
-      :: MonadIO m => Int -> SourcePos -> FilePath -> JournalParser m [FilePath]
-    getFilePaths parseroff parserpos filename = do
-        let curdir = takeDirectory (sourceName parserpos)
-        filename' <- lift $ expandHomePath filename
-                         `orRethrowIOError` (show parserpos ++ " locating " ++ filename)
-        -- Compiling filename as a glob pattern works even if it is a literal
-        fileglob <- case tryCompileWith compDefault{errorRecovery=False} filename' of
-            Right x -> pure x
-            Left e -> customFailure $
-                        parseErrorAt parseroff $ "Invalid glob pattern: " ++ e
-        -- Get all matching files in the current working directory, sorting in
-        -- lexicographic order to simulate the output of 'ls'.
-        filepaths <- liftIO $ sort <$> globDir1 fileglob curdir
-        if (not . null) filepaths
-            then pure filepaths
-            else customFailure $ parseErrorAt parseroff $
-                   "No existing files match pattern: " ++ filename
-
-    parseChild :: MonadIO m => SourcePos -> FilePath -> ErroringJournalParser m ()
-    parseChild parentpos filepath = do
-      parentj <- get
-
-      let parentfilestack = jincludefilestack parentj
-      when (filepath `elem` parentfilestack) $
-        fail ("Cyclic include: " ++ filepath)
-
-      childInput <- lift $ readFilePortably filepath
-                            `orRethrowIOError` (show parentpos ++ " reading " ++ filepath)
-      let initChildj = newJournalWithParseStateFrom filepath parentj
-
-      let parser = choiceInState
-            [ journalp
-            , timeclockfilep
-            , timedotfilep
-            ] -- can't include a csv file yet, that reader is special
-      updatedChildj <- journalAddFile (filepath, childInput) <$>
-                        parseIncludeFile parser initChildj filepath childInput
-
-      -- discard child's parse info,  combine other fields
-      put $ updatedChildj <> parentj
-
-    newJournalWithParseStateFrom :: FilePath -> Journal -> Journal
-    newJournalWithParseStateFrom filepath j = mempty{
-      jparsedefaultyear      = jparsedefaultyear j
-      ,jparsedefaultcommodity = jparsedefaultcommodity j
-      ,jparseparentaccounts   = jparseparentaccounts j
-      ,jparsealiases          = jparsealiases j
-      ,jcommodities           = jcommodities j
-      -- ,jparsetransactioncount = jparsetransactioncount j
-      ,jparsetimeclockentries = jparsetimeclockentries j
-      ,jincludefilestack      = filepath : jincludefilestack j
-      }
-
--- | Lift an IO action into the exception monad, rethrowing any IO
--- error with the given message prepended.
-orRethrowIOError :: MonadIO m => IO a -> String -> TextParser m a
-orRethrowIOError io msg = do
-  eResult <- liftIO $ (Right <$> io) `C.catch` \(e::C.IOException) -> pure $ Left $ printf "%s:\n%s" msg (show e)
-  case eResult of
-    Right res -> pure res
-    Left errMsg -> fail errMsg
+  return $ IncludeDirective filename
 
 -- Parse an account directive, adding its info to the journal's
 -- list of account declarations.
-accountdirectivep :: JournalParser m ()
+accountdirectivep :: Parser Directive
 accountdirectivep = do
   off <- getOffset -- XXX figure out a more precise position later
 
   string "account"
-  lift (skipSome spacenonewline)
+  (skipSome P.spacenonewline)
 
-  -- the account name, possibly modified by preceding alias or apply account directives
-  acct <- modifiedaccountnamep
+  -- the account name, UNMODIFIED by preceding alias or apply account directives
+  acct <- accountnamep
 
   -- maybe an account type code (ALERX) after two or more spaces
   -- XXX added in 1.11, deprecated in 1.13, remove in 1.14
-  mtypecode :: Maybe Char <- lift $ optional $ try $ do
-    skipSome spacenonewline -- at least one more space in addition to the one consumed by modifiedaccountp 
+  mtypecode <- optional $ try $ do
+    skipSome P.spacenonewline -- at least one more space in addition to the one consumed by modifiedaccountp
     choice $ map char "ALERX"
 
   -- maybe a comment, on this and/or following lines
-  (cmt, tags) <- lift transactioncommentp
-  
+  (cmt, tags) <- transactioncommentp
+
   -- maybe Ledger-style subdirectives (ignored)
   skipMany indentedlinep
 
   -- an account type may have been set by account type code or a tag;
   -- the latter takes precedence
   let
-    mtypecode' :: Maybe Text = maybe
+    mtypecode' = maybe
       (T.singleton <$> mtypecode)
       Just
       $ lookup accountTypeTagName tags
     metype = parseAccountTypeCode <$> mtypecode'
 
-  -- update the journal
-  addAccountDeclaration (acct, cmt, tags)
-  case metype of
-    Nothing         -> return ()
-    Just (Right t)  -> addDeclaredAccountType acct t
+  metype' <- case metype of
+    Nothing         -> return Nothing
+    Just (Right t)  -> return $ Just t
     Just (Left err) -> customFailure $ parseErrorAt off err
-
+  return $ AccountDirective acct metype' tags
 -- The special tag used for declaring account type. XXX change to "class" ?
 accountTypeTagName = "type"
 
-parseAccountTypeCode :: Text -> Either String AccountType
+parseAccountTypeCode :: Text -> Either String H.AccountType
 parseAccountTypeCode s =
   case T.toLower s of
     "asset"     -> Right Asset
@@ -317,22 +178,8 @@ parseAccountTypeCode s =
     err = "invalid account type code "++T.unpack s++", should be one of " ++
           (intercalate ", " $ ["A","L","E","R","X","ASSET","LIABILITY","EQUITY","REVENUE","EXPENSE"])
 
--- Add an account declaration to the journal, auto-numbering it.
-addAccountDeclaration :: (AccountName,Text,[Tag]) -> JournalParser m ()
-addAccountDeclaration (a,cmt,tags) =
-  modify' (\j ->
-             let
-               decls = jdeclaredaccounts j
-               d     = (a, nullaccountdeclarationinfo{
-                              adicomment          = cmt
-                             ,aditags             = tags
-                             ,adideclarationorder = length decls + 1
-                             })
-             in
-               j{jdeclaredaccounts = d:decls})
-
-indentedlinep :: JournalParser m String
-indentedlinep = lift (skipSome spacenonewline) >> (rstrip <$> lift restofline)
+indentedlinep :: Parser String
+indentedlinep = (skipSome P.spacenonewline) >> (S.rstrip <$> restofline)
 
 -- | Parse a one-line or multi-line commodity directive.
 --
@@ -340,27 +187,30 @@ indentedlinep = lift (skipSome spacenonewline) >> (rstrip <$> lift restofline)
 -- >>> Right _ <- rjp commoditydirectivep "commodity $\n  format $1.00"
 -- >>> Right _ <- rjp commoditydirectivep "commodity $\n\n" -- a commodity with no format
 -- >>> Right _ <- rjp commoditydirectivep "commodity $1.00\n  format $1.00" -- both, what happens ?
-commoditydirectivep :: JournalParser m ()
+commoditydirectivep :: Parser Directive
 commoditydirectivep = commoditydirectiveonelinep <|> commoditydirectivemultilinep
 
 -- | Parse a one-line commodity directive.
 --
 -- >>> Right _ <- rjp commoditydirectiveonelinep "commodity $1.00"
 -- >>> Right _ <- rjp commoditydirectiveonelinep "commodity $1.00 ; blah\n"
-commoditydirectiveonelinep :: JournalParser m ()
+commoditydirectiveonelinep :: Parser Directive
 commoditydirectiveonelinep = do
-  (off, Amount{acommodity,astyle}) <- try $ do
+  (off, H.Amount{H.acommodity,H.astyle}) <- try $ do
     string "commodity"
-    lift (skipSome spacenonewline)
+    (skipSome P.spacenonewline)
     off <- getOffset
     amount <- amountp
     pure $ (off, amount)
-  lift (skipMany spacenonewline)
-  _ <- lift followingcommentp
-  let comm = Commodity{csymbol=acommodity, cformat=Just $ dbg2 "style from commodity directive" astyle}
+  (skipMany P.spacenonewline)
+  _ <- followingcommentp
+  let comm = H.Commodity{H.csymbol=acommodity, H.cformat=Just $ dbg2 "style from commodity directive" astyle}
+  undefined
+{-
   if asdecimalpoint astyle == Nothing
   then customFailure $ parseErrorAt off pleaseincludedecimalpoint
   else modify' (\j -> j{jcommodities=M.insert acommodity comm $ jcommodities j})
+-}
 
 pleaseincludedecimalpoint :: String
 pleaseincludedecimalpoint = "to avoid ambiguity, please include a decimal separator in commodity directives"
@@ -368,304 +218,403 @@ pleaseincludedecimalpoint = "to avoid ambiguity, please include a decimal separa
 -- | Parse a multi-line commodity directive, containing 0 or more format subdirectives.
 --
 -- >>> Right _ <- rjp commoditydirectivemultilinep "commodity $ ; blah \n  format $1.00 ; blah"
-commoditydirectivemultilinep :: JournalParser m ()
+commoditydirectivemultilinep :: Parser Directive
 commoditydirectivemultilinep = do
   string "commodity"
-  lift (skipSome spacenonewline)
-  sym <- lift commoditysymbolp
-  _ <- lift followingcommentp
+  (skipSome P.spacenonewline)
+  sym <- commoditysymbolp
+  _ <- followingcommentp
   mformat <- lastMay <$> many (indented $ formatdirectivep sym)
-  let comm = Commodity{csymbol=sym, cformat=mformat}
+  let comm = H.Commodity{H.csymbol=sym, H.cformat=mformat}
+  undefined
+{-
   modify' (\j -> j{jcommodities=M.insert sym comm $ jcommodities j})
+-}
   where
-    indented = (lift (skipSome spacenonewline) >>)
+    indented = ((skipSome P.spacenonewline) >>)
 
 -- | Parse a format (sub)directive, throwing a parse error if its
 -- symbol does not match the one given.
-formatdirectivep :: CommoditySymbol -> JournalParser m AmountStyle
+formatdirectivep :: H.CommoditySymbol -> Parser H.AmountStyle
 formatdirectivep expectedsym = do
   string "format"
-  lift (skipSome spacenonewline)
+  (skipSome P.spacenonewline)
   off <- getOffset
-  Amount{acommodity,astyle} <- amountp
-  _ <- lift followingcommentp
+  H.Amount{H.acommodity,H.astyle} <- amountp
+  _ <- followingcommentp
+  undefined
+{-
   if acommodity==expectedsym
-    then 
+    then
       if asdecimalpoint astyle == Nothing
       then customFailure $ parseErrorAt off pleaseincludedecimalpoint
       else return $ dbg2 "style from format subdirective" astyle
     else customFailure $ parseErrorAt off $
          printf "commodity directive symbol \"%s\" and format directive symbol \"%s\" should be the same" expectedsym acommodity
+-}
 
-keywordp :: String -> JournalParser m ()
+keywordp :: String -> Parser ()
 keywordp = (() <$) . string . fromString
 
-spacesp :: JournalParser m ()
-spacesp = () <$ lift (skipSome spacenonewline)
+spacesp :: Parser ()
+spacesp = () <$ (skipSome P.spacenonewline)
 
 -- | Backtracking parser similar to string, but allows varying amount of space between words
-keywordsp :: String -> JournalParser m ()
+keywordsp :: String -> Parser ()
 keywordsp = try . sequence_ . intersperse spacesp . map keywordp . words
 
-applyaccountdirectivep :: JournalParser m ()
+applyaccountdirectivep :: Parser Directive
 applyaccountdirectivep = do
   keywordsp "apply account" <?> "apply account directive"
-  lift (skipSome spacenonewline)
-  parent <- lift accountnamep
+  (skipSome P.spacenonewline)
+  parent <- accountnamep
   newline
-  pushParentAccount parent
+  return $ ApplyAccountDirective parent
 
-endapplyaccountdirectivep :: JournalParser m ()
+endapplyaccountdirectivep :: Parser Directive
 endapplyaccountdirectivep = do
   keywordsp "end apply account" <?> "end apply account directive"
-  popParentAccount
+  return $ EndApplyAccountDirective
 
-aliasdirectivep :: JournalParser m ()
+aliasdirectivep :: Parser Directive
 aliasdirectivep = do
   string "alias"
-  lift (skipSome spacenonewline)
-  alias <- lift accountaliasp
-  addAccountAlias alias
+  (skipSome P.spacenonewline)
+  alias <- accountaliasp
+  return $ AliasDirective alias
 
-accountaliasp :: TextParser m AccountAlias
+accountaliasp :: Parser H.AccountAlias
 accountaliasp = regexaliasp <|> basicaliasp
 
-basicaliasp :: TextParser m AccountAlias
+basicaliasp :: Parser H.AccountAlias
 basicaliasp = do
   -- dbgparse 0 "basicaliasp"
-  old <- rstrip <$> (some $ noneOf ("=" :: [Char]))
+  old <- S.rstrip <$> (some $ noneOf ("=" :: [Char]))
   char '='
-  skipMany spacenonewline
-  new <- rstrip <$> anySingle `manyTill` eolof  -- eol in journal, eof in command lines, normally
+  skipMany P.spacenonewline
+  new <- S.rstrip <$> anySingle `manyTill` eolof  -- eol in journal, eof in command lines, normally
   return $ BasicAlias (T.pack old) (T.pack new)
 
-regexaliasp :: TextParser m AccountAlias
+regexaliasp :: Parser H.AccountAlias
 regexaliasp = do
   -- dbgparse 0 "regexaliasp"
   char '/'
   re <- some $ noneOf ("/\n\r" :: [Char]) -- paranoid: don't try to read past line end
   char '/'
-  skipMany spacenonewline
+  skipMany P.spacenonewline
   char '='
-  skipMany spacenonewline
+  skipMany P.spacenonewline
   repl <- anySingle `manyTill` eolof
   return $ RegexAlias re repl
 
-endaliasesdirectivep :: JournalParser m ()
+endaliasesdirectivep :: Parser Directive
 endaliasesdirectivep = do
   keywordsp "end aliases" <?> "end aliases directive"
-  clearAccountAliases
+  return $ EndAliasesDirective
 
-tagdirectivep :: JournalParser m ()
+tagdirectivep :: Parser Directive
 tagdirectivep = do
   string "tag" <?> "tag directive"
-  lift (skipSome spacenonewline)
-  _ <- lift $ some nonspace
-  lift restofline
-  return ()
+  (skipSome P.spacenonewline)
+  _ <- some nonspace
+  restofline
+  return $ TagDirective
 
-endtagdirectivep :: JournalParser m ()
+endtagdirectivep :: Parser Directive
 endtagdirectivep = do
   (keywordsp "end tag" <|> keywordp "pop") <?> "end tag or pop directive"
-  lift restofline
-  return ()
+  restofline
+  return $ EndTagDirective
 
-defaultyeardirectivep :: JournalParser m ()
+defaultyeardirectivep :: Parser Directive
 defaultyeardirectivep = do
   char 'Y' <?> "default year"
-  lift (skipMany spacenonewline)
+  (skipMany P.spacenonewline)
   y <- some digitChar
   let y' = read y
   failIfInvalidYear y
-  setYear y'
+  return $ DefaultYearDirective y'
 
-defaultcommoditydirectivep :: JournalParser m ()
+defaultcommoditydirectivep :: Parser Directive
 defaultcommoditydirectivep = do
   char 'D' <?> "default commodity"
-  lift (skipSome spacenonewline)
+  (skipSome P.spacenonewline)
   off <- getOffset
-  Amount{acommodity,astyle} <- amountp
-  lift restofline
+  H.Amount{H.acommodity,H.astyle} <- amountp
+  restofline
   if asdecimalpoint astyle == Nothing
   then customFailure $ parseErrorAt off pleaseincludedecimalpoint
-  else setDefaultCommodityAndStyle (acommodity, astyle)
+  else return $ DefaultCommodityDirective acommodity astyle
 
-marketpricedirectivep :: JournalParser m MarketPrice
+marketpricedirectivep :: Parser H.MarketPrice
 marketpricedirectivep = do
   char 'P' <?> "market price"
-  lift (skipMany spacenonewline)
-  date <- try (do {LocalTime d _ <- datetimep; return d}) <|> datep -- a time is ignored
-  lift (skipSome spacenonewline)
-  symbol <- lift commoditysymbolp
-  lift (skipMany spacenonewline)
+  (skipMany P.spacenonewline)
+  undefined
+  date <- undefined -- try (do {LocalTime d _ <- datetimep; return d}) <|> datep -- a time is ignored
+  (skipSome P.spacenonewline)
+  symbol <- commoditysymbolp
+  (skipMany P.spacenonewline)
   price <- amountp
-  lift restofline
+  restofline
   return $ MarketPrice date symbol price
 
-ignoredpricecommoditydirectivep :: JournalParser m ()
+ignoredpricecommoditydirectivep :: Parser Directive
 ignoredpricecommoditydirectivep = do
   char 'N' <?> "ignored-price commodity"
-  lift (skipSome spacenonewline)
-  lift commoditysymbolp
-  lift restofline
-  return ()
+  (skipSome P.spacenonewline)
+  c <- commoditysymbolp
+  restofline
+  return $ IgnoredPriceCommodityDirective c
 
-commodityconversiondirectivep :: JournalParser m ()
+commodityconversiondirectivep :: Parser Directive
 commodityconversiondirectivep = do
   char 'C' <?> "commodity conversion"
-  lift (skipSome spacenonewline)
-  amountp
-  lift (skipMany spacenonewline)
+  (skipSome P.spacenonewline)
+  a1 <- amountp
+  (skipMany P.spacenonewline)
   char '='
-  lift (skipMany spacenonewline)
-  amountp
-  lift restofline
-  return ()
+  (skipMany P.spacenonewline)
+  a2 <- amountp
+  restofline
+  return $ CommodityConversionDirective a1 a2
 
 --- ** transactions
 
-transactionmodifierp :: JournalParser m TransactionModifier
+transactionmodifierp :: Parser H.TransactionModifier
 transactionmodifierp = do
   char '=' <?> "modifier transaction"
-  lift (skipMany spacenonewline)
-  querytxt <- lift $ T.strip <$> descriptionp
-  (_comment, _tags) <- lift transactioncommentp   -- TODO apply these to modified txns ?
+  (skipMany P.spacenonewline)
+  querytxt <- T.strip <$> descriptionp
+  (_comment, _tags) <- transactioncommentp   -- TODO apply these to modified txns ?
   postings <- postingsp Nothing
-  return $ TransactionModifier querytxt postings
+  return $ H.TransactionModifier querytxt postings
 
 -- | Parse a periodic transaction
 --
 -- This reuses periodexprp which parses period expressions on the command line.
--- This is awkward because periodexprp supports relative and partial dates, 
+-- This is awkward because periodexprp supports relative and partial dates,
 -- which we don't really need here, and it doesn't support the notion of a
 -- default year set by a Y directive, which we do need to consider here.
 -- We resolve it as follows: in periodic transactions' period expressions,
 -- if there is a default year Y in effect, partial/relative dates are calculated
 -- relative to Y/1/1. If not, they are calculated related to today as usual.
-periodictransactionp :: MonadIO m => JournalParser m PeriodicTransaction
+periodictransactionp :: Parser H.PeriodicTransaction
 periodictransactionp = do
 
   -- first line
   char '~' <?> "periodic transaction"
-  lift $ skipMany spacenonewline
+  skipMany P.spacenonewline
   -- a period expression
   off <- getOffset
-  
-  -- if there's a default year in effect, use Y/1/1 as base for partial/relative dates
-  today <- liftIO getCurrentDay
-  mdefaultyear <- getYear
-  let refdate = case mdefaultyear of
-                  Nothing -> today 
-                  Just y  -> fromGregorian y 1 1
-  periodExcerpt <- lift $ excerpt_ $
+
+  periodExcerpt <- excerpt_ $
                     singlespacedtextsatisfyingp (\c -> c /= ';' && c /= '\n')
   let periodtxt = T.strip $ getExcerptText periodExcerpt
 
-  -- first parsing with 'singlespacedtextp', then "re-parsing" with
-  -- 'periodexprp' saves 'periodexprp' from having to respect the single-
-  -- and double-space parsing rules
-  (interval, span) <- lift $ reparseExcerpt periodExcerpt $ do
-    pexp <- periodexprp refdate
-    (<|>) eof $ do
-      offset1 <- getOffset
-      void takeRest
-      offset2 <- getOffset
-      customFailure $ parseErrorAtRegion offset1 offset2 $
-           "remainder of period expression cannot be parsed"
-        <> "\nperhaps you need to terminate the period expression with a double space?"
-        <> "\na double space is required between period expression and description/comment"
-    pure pexp
-
-  -- In periodic transactions, the period expression has an additional constraint:
-  case checkPeriodicTransactionStartDate interval span periodtxt of
-    Just e -> customFailure $ parseErrorAt off e
-    Nothing -> pure ()
-  
-  status <- lift statusp <?> "cleared status"
-  code <- lift codep <?> "transaction code"
-  description <- lift $ T.strip <$> descriptionp
-  (comment, tags) <- lift transactioncommentp
+  status <- statusp <?> "cleared status"
+  code <- codep <?> "transaction code"
+  description <- T.strip <$> descriptionp
+  (comment, tags) <- transactioncommentp
   -- next lines; use same year determined above
-  postings <- postingsp (Just $ first3 $ toGregorian refdate)
+  postings <- postingsp undefined -- TODO this normally gets a year
 
   return $ nullperiodictransaction{
-     ptperiodexpr=periodtxt
-    ,ptinterval=interval
-    ,ptspan=span
-    ,ptstatus=status
-    ,ptcode=code
-    ,ptdescription=description
-    ,ptcomment=comment
-    ,pttags=tags
-    ,ptpostings=postings
+     H.ptperiodexpr=periodtxt
+    ,H.ptinterval=undefined
+    ,H.ptspan=undefined
+    ,H.ptstatus=status
+    ,H.ptcode=code
+    ,H.ptdescription=description
+    ,H.ptcomment=comment
+    ,H.pttags=tags
+    ,H.ptpostings=postings
     }
 
 -- | Parse a (possibly unbalanced) transaction.
-transactionp :: JournalParser m Transaction
+transactionp :: Parser H.Transaction
 transactionp = do
   -- dbgparse 0 "transactionp"
   startpos <- getSourcePos
-  date <- datep <?> "transaction"
-  edate <- optional (lift $ secondarydatep date) <?> "secondary date"
-  lookAhead (lift spacenonewline <|> newline) <?> "whitespace or newline"
-  status <- lift statusp <?> "cleared status"
-  code <- lift codep <?> "transaction code"
-  description <- lift $ T.strip <$> descriptionp
-  (comment, tags) <- lift transactioncommentp
+  date <- undefined -- datep <?> "transaction"
+  edate <- optional (secondarydatep date) <?> "secondary date"
+  lookAhead (P.spacenonewline <|> newline) <?> "whitespace or newline"
+  status <- statusp <?> "cleared status"
+  code <- codep <?> "transaction code"
+  description <- T.strip <$> descriptionp
+  (comment, tags) <- transactioncommentp
   let year = first3 $ toGregorian date
   postings <- postingsp (Just year)
   endpos <- getSourcePos
   let sourcepos = journalSourcePos startpos endpos
-  return $ txnTieKnot $ Transaction 0 "" sourcepos date edate status code description comment tags postings
+  return $ txnTieKnot $ H.Transaction 0 "" sourcepos date edate status code description comment tags postings
 
 --- ** postings
 
 -- Parse the following whitespace-beginning lines as postings, posting
 -- tags, and/or comments (inferring year, if needed, from the given date).
-postingsp :: Maybe Year -> JournalParser m [Posting]
+postingsp :: Maybe H.Year -> Parser [H.Posting]
 postingsp mTransactionYear = many (postingp mTransactionYear) <?> "postings"
 
--- linebeginningwithspaces :: JournalParser m String
+-- linebeginningwithspaces :: Parser String
 -- linebeginningwithspaces = do
---   sp <- lift (skipSome spacenonewline)
+--   sp <- (skipSome P.spacenonewline)
 --   c <- nonspace
---   cs <- lift restofline
+--   cs <- restofline
 --   return $ sp ++ (c:cs) ++ "\n"
 
-postingp :: Maybe Year -> JournalParser m Posting
+postingp :: Maybe H.Year -> Parser H.Posting
 postingp mTransactionYear = do
-  -- lift $ dbgparse 0 "postingp"
+  -- $ dbgparse 0 "postingp"
   (status, account) <- try $ do
-    lift (skipSome spacenonewline)
-    status <- lift statusp
-    lift (skipMany spacenonewline)
-    account <- modifiedaccountnamep
+    (skipSome P.spacenonewline)
+    status <- statusp
+    (skipMany P.spacenonewline)
+    account <- accountnamep -- TODO this is changed
     return (status, account)
   let (ptype, account') = (accountNamePostingType account, textUnbracket account)
-  lift (skipMany spacenonewline)
+  (skipMany P.spacenonewline)
   amount <- option missingmixedamt $ Mixed . (:[]) <$> amountp
-  lift (skipMany spacenonewline)
+  (skipMany P.spacenonewline)
   massertion <- optional $ balanceassertionp
   _ <- fixedlotpricep
-  lift (skipMany spacenonewline)
-  (comment,tags,mdate,mdate2) <- lift $ postingcommentp mTransactionYear
-  return posting
-   { pdate=mdate
-   , pdate2=mdate2
-   , pstatus=status
-   , paccount=account'
-   , pamount=amount
-   , pcomment=comment
-   , ptype=ptype
-   , ptags=tags
-   , pbalanceassertion=massertion
+  (skipMany P.spacenonewline)
+  (comment,tags,mdate,mdate2) <- postingcommentp mTransactionYear
+  return H.posting
+   { H.pdate=mdate
+   , H.pdate2=mdate2
+   , H.pstatus=status
+   , H.paccount=account'
+   , H.pamount=amount
+   , H.pcomment=comment
+   , H.ptype=ptype
+   , H.ptags=tags
+   , H.pbalanceassertion=massertion
    }
+
+--- * from Common.hs
+
+-- | Parse a single-commodity amount, with optional symbol on the left or
+-- right, optional unit or total price, and optional (ignored)
+-- ledger-style balance assertion or fixed lot price declaration.
+amountp :: Parser H.Amount
+amountp = label "amount" $ do
+  amount <- amountwithoutpricep
+  skipMany spacenonewline
+  price <- priceamountp
+  pure $ amount { H.aprice = price }
+
+amountwithoutpricep :: Parser H.Amount
+amountwithoutpricep = do
+  (mult, sign) <- (,) <$> multiplierp <*> signp
+  leftsymbolamountp mult sign <|> rightornosymbolamountp mult sign
+
+  where
+
+  leftsymbolamountp :: Bool -> (Decimal -> Decimal) -> Parser H.Amount
+  leftsymbolamountp mult sign = label "amount" $ do
+    c <- commoditysymbolp
+    suggestedStyle <- undefined -- getAmountStyle c
+    commodityspaced <- skipMany' spacenonewline
+    sign2 <- signp
+    offBeforeNum <- getOffset
+    ambiguousRawNum <- rawnumberp
+    mExponent <- optional $ try exponentp
+    offAfterNum <- getOffset
+    let numRegion = (offBeforeNum, offAfterNum)
+    (q,prec,mdec,mgrps) <- interpretNumber numRegion suggestedStyle ambiguousRawNum mExponent
+    let s = amountstyle{H.ascommodityside=L, H.ascommodityspaced=commodityspaced, H.asprecision=prec, H.asdecimalpoint=mdec, H.asdigitgroups=mgrps}
+    return $ nullamt{H.acommodity=c, H.aquantity=sign (sign2 q), H.aismultiplier=mult, H.astyle=s, H.aprice=NoPrice}
+
+  rightornosymbolamountp :: Bool -> (Decimal -> Decimal) -> Parser H.Amount
+  rightornosymbolamountp mult sign = label "amount" $ do
+    offBeforeNum <- getOffset
+    ambiguousRawNum <- rawnumberp
+    mExponent <- optional $ try exponentp
+    offAfterNum <- getOffset
+    let numRegion = (offBeforeNum, offAfterNum)
+    mSpaceAndCommodity <- optional $ try $ (,) <$> skipMany' spacenonewline <*> commoditysymbolp
+    case mSpaceAndCommodity of
+      -- right symbol amount
+      Just (commodityspaced, c) -> do
+        suggestedStyle <- undefined -- getAmountStyle c
+        (q,prec,mdec,mgrps) <- interpretNumber numRegion suggestedStyle ambiguousRawNum mExponent
+        let s = amountstyle{H.ascommodityside=R, H.ascommodityspaced=commodityspaced, H.asprecision=prec, H.asdecimalpoint=mdec, H.asdigitgroups=mgrps}
+        return $ nullamt{H.acommodity=c, aquantity=sign q, aismultiplier=mult, astyle=s, aprice=NoPrice}
+      -- no symbol amount
+      Nothing -> do
+        suggestedStyle <- undefined -- getDefaultAmountStyle
+        (q,prec,mdec,mgrps) <- interpretNumber numRegion suggestedStyle ambiguousRawNum mExponent
+        -- if a default commodity has been set, apply it and its style to this amount
+        -- (unless it's a multiplier in an automated posting)
+        defcs <- undefined -- getDefaultCommodityAndStyle
+        let (c,s) = case (mult, defcs) of
+              (False, Just (defc,defs)) -> (defc, defs{asprecision=max (asprecision defs) prec})
+              _ -> ("", amountstyle{asprecision=prec, asdecimalpoint=mdec, asdigitgroups=mgrps})
+        return $ nullamt{H.acommodity=c, aquantity=sign q, aismultiplier=mult, astyle=s, aprice=NoPrice}
+
+  -- For reducing code duplication. Doesn't parse anything. Has the type
+  -- of a parser only in order to throw parse errors (for convenience).
+  interpretNumber
+    :: (Int, Int) -- offsets
+    -> Maybe H.AmountStyle
+    -> Either AmbiguousNumber RawNumber
+    -> Maybe Int
+    -> Parser (H.Quantity, Int, Maybe Char, Maybe DigitGroupStyle)
+  interpretNumber posRegion suggestedStyle ambiguousNum mExp =
+    let rawNum = either (disambiguateNumber suggestedStyle) id ambiguousNum
+    in  case fromRawNumber rawNum mExp of
+          Left errMsg -> customFailure $
+                           uncurry parseErrorAtRegion posRegion errMsg
+          Right res -> pure res
+
+balanceassertionp :: Parser BalanceAssertion
+balanceassertionp = do
+  sourcepos <- genericSourcePos <$> getSourcePos
+  char '='
+  istotal <- fmap isJust $ optional $ try $ char '='
+  isinclusive <- fmap isJust $ optional $ try $ char '*'
+  skipMany spacenonewline
+  -- this amount can have a price; balance assertions ignore it,
+  -- but balance assignments will use it
+  a <- amountp <?> "amount (for a balance assertion or assignment)"
+  return BalanceAssertion
+    { baamount    = a
+    , batotal     = istotal
+    , bainclusive = isinclusive
+    , baposition  = sourcepos
+    }
+
+fixedlotpricep :: Parser (Maybe Amount)
+fixedlotpricep = optional $ do
+  try $ do
+    skipMany spacenonewline
+    char '{'
+  skipMany spacenonewline
+  char '='
+  skipMany spacenonewline
+  a <- amountwithoutpricep <?> "unpriced amount (for an ignored ledger-style fixed lot price)"
+  skipMany spacenonewline
+  char '}'
+  return a
+
+priceamountp :: Parser Price
+priceamountp = option NoPrice $ do
+  char '@'
+  priceConstructor <- char '@' *> pure TotalPrice <|> pure UnitPrice
+
+  skipMany spacenonewline
+  priceAmount <- amountwithoutpricep <?> "unpriced amount (specifying a price)"
+
+  pure $ priceConstructor priceAmount
+
 
 --- * tests
 
+{-
 tests_JournalReader = tests "JournalReader" [
 
-   let p = lift accountnamep :: JournalParser IO AccountName in
+   let p = accountnamep :: JournalParser IO AccountName in
    tests "accountnamep" [
      test "basic" $ expectParse p "a:b:c"
     ,_test "empty inner component" $ expectParseError p "a::c" ""  -- TODO
@@ -682,7 +631,7 @@ tests_JournalReader = tests "JournalReader" [
     test "YYYY-MM-DD" $ expectParse datep "2018-01-01"
     test "YYYY.MM.DD" $ expectParse datep "2018.01.01"
     test "yearless date with no default year" $ expectParseError datep "1/1" "current year is unknown"
-    test "yearless date with default year" $ do 
+    test "yearless date with default year" $ do
       let s = "1/1"
       ep <- parseWithState mempty{jparsedefaultyear=Just 2018} datep s
       either (fail.("parse error at "++).customErrorBundlePretty) (const ok) ep
@@ -707,7 +656,7 @@ tests_JournalReader = tests "JournalReader" [
   ,tests "periodictransactionp" [
 
     test "more period text in comment after one space" $ expectParseEq periodictransactionp
-      "~ monthly from 2018/6 ;In 2019 we will change this\n" 
+      "~ monthly from 2018/6 ;In 2019 we will change this\n"
       nullperiodictransaction {
          ptperiodexpr  = "monthly from 2018/6"
         ,ptinterval    = Months 1
@@ -717,7 +666,7 @@ tests_JournalReader = tests "JournalReader" [
         }
 
     ,test "more period text in description after two spaces" $ expectParseEq periodictransactionp
-      "~ monthly from 2018/6   In 2019 we will change this\n" 
+      "~ monthly from 2018/6   In 2019 we will change this\n"
       nullperiodictransaction {
          ptperiodexpr  = "monthly from 2018/6"
         ,ptinterval    = Months 1
@@ -752,16 +701,16 @@ tests_JournalReader = tests "JournalReader" [
     ]
 
   ,tests "postingp" [
-     test "basic" $ expectParseEq (postingp Nothing) 
+     test "basic" $ expectParseEq (postingp Nothing)
       "  expenses:food:dining  $10.00   ; a: a a \n   ; b: b b \n"
       posting{
-        paccount="expenses:food:dining", 
-        pamount=Mixed [usd 10], 
-        pcomment="a: a a\nb: b b\n", 
+        paccount="expenses:food:dining",
+        pamount=Mixed [usd 10],
+        pcomment="a: a a\nb: b b\n",
         ptags=[("a","a a"), ("b","b b")]
         }
 
-    ,test "posting dates" $ expectParseEq (postingp Nothing) 
+    ,test "posting dates" $ expectParseEq (postingp Nothing)
       " a  1. ; date:2012/11/28, date2=2012/11/29,b:b\n"
       nullposting{
          paccount="a"
@@ -772,14 +721,14 @@ tests_JournalReader = tests "JournalReader" [
         ,pdate2=Nothing  -- Just $ fromGregorian 2012 11 29
         }
 
-    ,test "posting dates bracket syntax" $ expectParseEq (postingp Nothing) 
+    ,test "posting dates bracket syntax" $ expectParseEq (postingp Nothing)
       " a  1. ; [2012/11/28=2012/11/29]\n"
       nullposting{
          paccount="a"
         ,pamount=Mixed [num 1]
         ,pcomment="[2012/11/28=2012/11/29]\n"
         ,ptags=[]
-        ,pdate= Just $ fromGregorian 2012 11 28 
+        ,pdate= Just $ fromGregorian 2012 11 28
         ,pdate2=Just $ fromGregorian 2012 11 29
         }
 
@@ -792,7 +741,7 @@ tests_JournalReader = tests "JournalReader" [
 
   ,tests "transactionmodifierp" [
 
-    test "basic" $ expectParseEq transactionmodifierp 
+    test "basic" $ expectParseEq transactionmodifierp
       "= (some value expr)\n some:postings  1.\n"
       nulltransactionmodifier {
         tmquerytxt = "(some value expr)"
@@ -801,10 +750,10 @@ tests_JournalReader = tests "JournalReader" [
     ]
 
   ,tests "transactionp" [
-  
+
      test "just a date" $ expectParseEq transactionp "2015/1/1\n" nulltransaction{tdate=fromGregorian 2015 1 1}
-  
-    ,test "more complex" $ expectParseEq transactionp 
+
+    ,test "more complex" $ expectParseEq transactionp
       (T.unlines [
         "2012/05/14=2012/05/15 (code) desc  ; tcomment1",
         "    ; tcomment2",
@@ -837,7 +786,7 @@ tests_JournalReader = tests "JournalReader" [
             }
           ]
       }
-  
+
     ,test "parses a well-formed transaction" $
       expect $ isRight $ rjp transactionp $ T.unlines
         ["2007/01/28 coopportunity"
@@ -845,10 +794,10 @@ tests_JournalReader = tests "JournalReader" [
         ,"    assets:checking                          $-47.18"
         ,""
         ]
-  
+
     ,test "does not parse a following comment as part of the description" $
       expectParseEqOn transactionp "2009/1/1 a ;comment\n b 1\n" tdescription "a"
-  
+
     ,test "transactionp parses a following whitespace line" $
       expect $ isRight $ rjp transactionp $ T.unlines
         ["2012/1/1"
@@ -867,7 +816,7 @@ tests_JournalReader = tests "JournalReader" [
         ]
 
     ,test "comments everywhere, two postings parsed" $
-      expectParseEqOn transactionp 
+      expectParseEqOn transactionp
         (T.unlines
           ["2009/1/1 x  ; transaction comment"
           ," a  1  ; posting 1 comment"
@@ -877,13 +826,13 @@ tests_JournalReader = tests "JournalReader" [
           ])
         (length . tpostings)
         2
-  
+
     ]
 
   -- directives
 
   ,tests "directivep" [
-    test "supports !" $ do 
+    test "supports !" $ do
       expectParseE directivep "!account a\n"
       expectParseE directivep "!D 1.0\n"
     ]
@@ -948,3 +897,4 @@ tests_JournalReader = tests "JournalReader" [
    ]
 
   ]
+-}

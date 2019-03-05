@@ -19,6 +19,8 @@ Some of these might belong in Hledger.Read.JournalReader or Hledger.Read.
 {-# LANGUAGE PackageImports #-}
 
 module Hledger.Read.Common (
+  AmbiguousNumber (..),
+  RawNumber (..),
   Reader (..),
   InputOpts (..),
   definputopts,
@@ -49,6 +51,15 @@ module Hledger.Read.Common (
   getAccountAliases,
   clearAccountAliases,
   journalAddFile,
+  disambiguateNumber,
+  skipMany',
+  signp,
+  multiplierp,
+  exponentp,
+  textUnbracket,
+  toGregorian,
+  first3,
+  fromGregorian,
 
   -- * parsers
   -- ** transaction bits
